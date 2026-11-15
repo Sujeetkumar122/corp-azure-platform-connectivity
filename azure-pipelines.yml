@@ -1,0 +1,135 @@
+name: $(Build.DefinitionName)_$(Date:yyyyMMdd)$(Rev:.r)
+
+trigger:
+  branches:
+    include:
+      - main
+      - releases/*
+  paths:
+    include:
+      - environments/**
+      - modules/**
+      - azure-pipelines.yml
+
+pr:
+  branches:
+    include:
+      - main
+
+variables:
+  azureServiceConnection: 'Azure-DevOps-ServiceConnection'
+  devResourceGroup: 'rg-dev-connectivity-eastus2-01'
+  prodResourceGroup: 'rg-prod-connectivity-eastus2-01'
+  location: 'eastus2'
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+stages:
+  # ============================================================================
+  # Stage 1: Lint and Validate Bicep Templates
+  # ============================================================================
+  - stage: Validate
+    displayName: 'Lint & Compile Bicep Templates'
+    jobs:
+      - job: BicepValidation
+        displayName: 'Bicep Syntax & Compilation Check'
+        steps:
+          - checkout: self
+            fetchDepth: 0
+
+          - task: AzureCLI@2
+            displayName: 'Compile Dev & Prod Environments'
+            inputs:
+              azureSubscription: $(azureServiceConnection)
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                set -e
+                echo "===> Compiling Dev Environment..."
+                az bicep build --file environments/dev/main.bicep
+                echo "===> Compiling Prod Environment..."
+                az bicep build --file environments/prod/main.bicep
+                echo "All Bicep templates compiled successfully!"
+
+  # ============================================================================
+  # Stage 2: What-If Dry Run Analysis
+  # ============================================================================
+  - stage: WhatIf
+    displayName: 'Deployment What-If Preview'
+    dependsOn: Validate
+    jobs:
+      - job: DevWhatIf
+        displayName: 'Dev What-If Dry Run'
+        steps:
+          - checkout: self
+          - task: AzureCLI@2
+            displayName: 'Execute Azure Deployment What-If (Dev)'
+            inputs:
+              azureSubscription: $(azureServiceConnection)
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                echo "Previewing changes for Dev Connectivity..."
+                az deployment group what-if \
+                  --resource-group $(devResourceGroup) \
+                  --template-file environments/dev/main.bicep \
+                  --parameters environments/dev/main.bicepparam
+
+  # ============================================================================
+  # Stage 3: Deploy to Development
+  # ============================================================================
+  - stage: DeployDev
+    displayName: 'Deploy to Development'
+    dependsOn: WhatIf
+    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+    jobs:
+      - deployment: DeployDevInfra
+        displayName: 'Deploy Dev Connectivity Tier'
+        environment: 'Development'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+                - task: AzureCLI@2
+                  displayName: 'Deploy Bicep to Dev'
+                  inputs:
+                    azureSubscription: $(azureServiceConnection)
+                    scriptType: 'bash'
+                    scriptLocation: 'inlineScript'
+                    inlineScript: |
+                      az deployment group create \
+                        --name "deploy-connectivity-dev-$(Build.BuildId)" \
+                        --resource-group $(devResourceGroup) \
+                        --template-file environments/dev/main.bicep \
+                        --parameters environments/dev/main.bicepparam
+
+  # ============================================================================
+  # Stage 4: Deploy to Production (With Environment Gates)
+  # ============================================================================
+  - stage: DeployProd
+    displayName: 'Deploy to Production'
+    dependsOn: DeployDev
+    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+    jobs:
+      - deployment: DeployProdInfra
+        displayName: 'Deploy Prod Connectivity Tier'
+        environment: 'Production'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+                - task: AzureCLI@2
+                  displayName: 'Deploy Bicep to Prod'
+                  inputs:
+                    azureSubscription: $(azureServiceConnection)
+                    scriptType: 'bash'
+                    scriptLocation: 'inlineScript'
+                    inlineScript: |
+                      az deployment group create \
+                        --name "deploy-connectivity-prod-$(Build.BuildId)" \
+                        --resource-group $(prodResourceGroup) \
+                        --template-file environments/prod/main.bicep \
+                        --parameters environments/prod/main.bicepparam
